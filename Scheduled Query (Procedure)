@@ -6,7 +6,6 @@ BEGIN
 This stored procedure deletes data within a specified date range from a destination table
 and inserts fresh data from a source view into the destination table, after performing data validation checks.
 
-
 Arguments:
 - interval_start_date: The start of the date range, as days ago from today.
 - interval_end_date: The end of the date range, as days ago from today.
