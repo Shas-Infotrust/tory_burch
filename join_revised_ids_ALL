@@ -1,0 +1,52 @@
+/*
+CODE DESCRIPTION
+This is the logic that will JOIN your Revised IDs to your raw GA4 Export table, or any table. 
+*/
+
+
+WITH
+runDates as (
+  select
+    -- FORMAT_DATE('%Y%m%d', DATE_SUB(@run_date, INTERVAL 1 DAY)) as startDate,
+    -- FORMAT_DATE('%Y%m%d', DATE_SUB(@run_date,INTERVAL 1 DAY)) as endDate
+     '20250601' as startDate,
+     '20250716' as endDate,
+    ),
+
+-- Step 1: Create a clean, session-level mapping table from REVISED ID table.
+-- This CTE uses SELECT DISTINCT to ensure there is only ONE row for each session_id.
+revised_id_table AS (
+  SELECT DISTINCT
+    session_id,
+    date,
+    revised_session_id,
+    revised_user_id,
+    revised_user_pseudo_id,
+    revised_user_id_array
+  FROM bigquery-prod-356116.ga4_qa_revised_id.ga4_revised_id_v7_1YEAR
+  WHERE
+   date between PARSE_DATE('%Y%m%d', (select startDate from runDates)) and PARSE_DATE('%Y%m%d', (select endDate from runDates))
+),
+
+clickstream_table AS (
+  SELECT 
+    *,
+    CONCAT(user_pseudo_id, 'a', (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) as session_id,
+    PARSE_DATE('%Y%m%d', event_date) as date
+  FROM
+  `tb-clickstream.analytics_262180980.events_*`
+WHERE
+   _TABLE_SUFFIX between (select startDate from runDates) and (select endDate from runDates)
+)
+
+SELECT
+  c.*,
+  r.revised_session_id,
+  r.revised_user_id,
+  r.revised_user_pseudo_id,
+  r.revised_user_id_array,
+FROM clickstream_table c
+LEFT JOIN 
+  revised_id_table r ON 
+    c.date = r.date AND
+    c.session_id = r.session_id
