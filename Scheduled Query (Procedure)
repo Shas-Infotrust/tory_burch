@@ -1,3 +1,32 @@
+
+/*
+CODE DESCRIPTION
+The scheduled queries procedure is designed to templatize repeatable processes.
+
+PROCEDURE LOGIC
+Source Table Check: Confirms the source table contains all specified dates, each with at least one non-null value for the indicated "check" field.
+If not, the query fails and an error message is generated.
+
+Destination Table Check: Ensures the destination table has fewer dates than the ones being added, each with at least one non-null value for the indicated "check" field.
+If this condition is not met, it means the table has already been updated, so the process stops before running the main table query (view).
+No error message is generated in this case.
+
+Insert Process: If both checks pass, the procedure runs Delete & Insert operations.
+Since this is a transaction, if any part of the query fails, the job will fail and the table will roll back to its previous version.
+When a failure occurs, an error message is surfaced.'
+
+SETUP
+1) Create a View:  Build the final version of the query that the procedure will reference for inserting data. This centralizes the query so that any updates automatically affect all scheduled queries.
+2) Call the Procedure: Pass in all required "arguments" (variables) for the specific table creation. Because the procedure is templatized, updates to the routine will automatically propagate to all scheduled queries.
+3) Schedule the Procedure: Use the same procedure and variables for all scheduled queries requiring the same updates to the table.
+----Once scheduled, you won’t need to modify the scheduled query unless updating variables or pausing it.
+----From that point, all updates are handled in the view or the procedure.
+
+*/
+
+
+
+
 CREATE OR REPLACE PROCEDURE `bigquery-prod-356116.ga4_2_PipelineAutomation.r_ga4_2_ScheduledQuery`(interval_start_date INT64, interval_end_date INT64, source_table STRING, source_date_field STRING, source_field_check_values STRING, destination_table STRING, destination_date_field STRING, destination_field_check_values STRING, query_view STRING, query_date_field STRING)
 OPTIONS (description="- interval_start_date: The start of the date range, as days ago from today.\n- interval_end_date: The end of the date range, as days ago from today.\n- source_table: The source table (e.g., `project.dataset.table_*`).\n- source_date_field: Date field in the source table.\n- source_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date. \n- destination_table: The target table for the DELETE and INSERT operations.\n- destination_date_field: Date field in the destination table. \n- destination_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date. \n- query_view: The view that is used to query data for insertion.\n- query_date_field: The date field withing the view. Important as it prevents the entire date range to run. ")
 BEGIN
