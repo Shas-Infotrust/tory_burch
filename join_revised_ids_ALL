@@ -1,6 +1,9 @@
 /*
 CODE DESCRIPTION
 This is the logic that will JOIN your Revised IDs to your raw GA4 Export table, or any table. 
+
+Other Required Queries
+--revised_ids_ALL
 */
 
 
