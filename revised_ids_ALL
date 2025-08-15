@@ -1,0 +1,147 @@
+/*
+This is a custom revision of GA4 IDs.
+
+This will create a table with:
+revised_user_id: This logic looks ahead 30 days to determine if a user eventually signs in, allowing earlier sessions to retroactively adopt that User ID (IDM ID). This enhances the dataset by attributing early funnel interactions—when users are not yet logged in—to the ID they use in later sessions."
+revised_session_id: There are situations in which a single user can generate multiple sessions within seconds. There is logic built in to use the first session_id if multiple session IDs occur within a 30 minute window.
+revised_user_pseudo_id: This ensures that there is only only pseudo ID that exists over a single revised_session_id. 
+revised_user_id_array: It is possible that multiple User IDs are used within a single session. So we incorporate revised_user_id_array. 
+
+along with...
+
+date & session_id to be able to JOIN by Date, then by Session ID to any GA4 table
+
+*/
+
+
+WITH events as 
+(select
+    parse_date('%Y%m%d',event_date) as date,
+    -- unique session id
+    concat(user_pseudo_id, 'a', (select value.int_value from unnest(event_params) where key = 'ga_session_id')) as session_id,
+    user_pseudo_id,
+    -- user_id. Event-level, essentially looks for all IDs in current session. Multiple IDs may exist. 
+    COALESCE(user_id, (SELECT up.value.string_value FROM UNNEST (user_properties) up WHERE up.key = 'idm_id')) as user_id,
+    -- BACKFILL user_id in a session, if multiple user_id in a session, only use the first one
+    first_value(COALESCE(user_id, (SELECT up.value.string_value FROM UNNEST (user_properties) up WHERE up.key = 'idm_id')) ignore nulls) over(
+      partition by concat(user_pseudo_id, 'a', (select value.int_value from unnest(event_params) where key = 'ga_session_id'))
+      order by
+        event_timestamp asc
+        rows between unbounded preceding and unbounded following
+    ) as back_fill_user_id,
+    --NEXT user_id for user_pseudo_id
+    --looks forward 30 days
+    first_value(COALESCE(user_id, (SELECT up.value.string_value FROM UNNEST (user_properties) up WHERE up.key = 'idm_id')) ignore nulls) over(
+      partition by user_pseudo_id
+      order by
+        event_timestamp asc
+        range between 0 following and 2592000000000 following
+    ) as next_user_id,
+    event_timestamp,
+  FROM
+  `tb-clickstream.analytics_262180980.events_*`
+WHERE
+   _TABLE_SUFFIX between suffixStartDate and suffixEndDate
+   AND
+   user_pseudo_id is not null --important to optimize the query. Non-consented data does get sent stripping the user_pseudo_id, which makes window functions an issue.
+),
+
+  -- Step 2: Create new user IDs.
+  new_id as
+  (select 
+    *, 
+    COALESCE(back_fill_user_id, next_user_id, user_pseudo_id) as id,  --used in next steps
+    COALESCE(user_id, back_fill_user_id, next_user_id) as revised_user_id 
+  from events
+  ),
+
+  --Step 3: Create next timestamp and last timestamp
+  user_session as 
+  (select
+  last_value(event_timestamp) over (partition by id
+      order by  event_timestamp asc
+        range between 1800000000 preceding and 1 preceding
+    ) as l_ts, --each event, find timestamp of previous event if it occured within 30 min
+    first_value(event_timestamp) over (partition by id
+      order by  event_timestamp asc
+        range between 1 following and 1800000000 following
+    ) as n_ts,--each event, find timestamp of next event if it occured within 30 min
+    *
+    from new_id),
+
+  --Step 4: Revised Session ID
+  --Takes the most recent non-null start_session_id across all the following rows until the next non-null start_session_id is found for a specific ID.
+  revised_session as 
+  (select *, 
+  last_value(start_session_id ignore nulls) over(
+      partition by id
+      order by  event_timestamp asc
+    ) as revised_session_id
+    from
+  (select
+  case when l_ts is null and n_ts is not null then session_id
+  when l_ts is null and n_ts is null then session_id
+  else null end as start_session_id, --session_start flag. Only if first event of a new session
+  * from user_session)),
+  
+  --Step 5: revised_user_psuedo_id
+  --Ensures that only one user_pseudo_id is associated with the newly created revised_session_id. 
+  --It takes all the events that share the same revised_session_id and assigns the very first user_pseudo_id that appeared to all of them
+  revised_pseudoid as (
+  select *, 
+  first_value(user_pseudo_id ignore nulls) over(
+      partition by revised_session_id
+      order by
+        event_timestamp asc) as revised_user_pseudo_id
+  from revised_session
+  ),
+
+
+--Step 6: Sessionize: List all the unique revised user IDs in a session, and grab the first revised session ids and user pseudo ids
+--First Logic ensures that the entire original Session ID only gets one revised value. Helps curb any intances where logic may be flawed and is attributing two revised ID to a single Session ID
+--Remove Date - Sessions can occur across dates. This can cause revised IDs to be different in certain edge cases when this occurs. Must remove date temporarily. 
+--It is possible that multiple User IDs are used within a single session. So we incorporate revised_user_id_array. 
+ session_summary_revised_ids as(
+  SELECT
+    session_id,
+    -- Single Row Array of all Distinct User IDs
+    ARRAY_AGG(DISTINCT revised_user_id IGNORE NULLS) as revised_user_id_array,
+    -- Adding first value of revised_user_id
+    ARRAY_AGG(revised_user_id ORDER BY event_timestamp ASC LIMIT 1)[SAFE_OFFSET(0)] as revised_user_id,
+    -- Use ARRAY_AGG to deterministically get the first value based on the timestamp.'
+    --there are outliers where at the end of the session a different session_id value appears'
+    ARRAY_AGG(revised_session_id ORDER BY event_timestamp ASC LIMIT 1)[SAFE_OFFSET(0)] as revised_session_id,
+    ARRAY_AGG(revised_user_pseudo_id ORDER BY event_timestamp ASC LIMIT 1)[SAFE_OFFSET(0)] as revised_user_pseudo_id 
+FROM revised_pseudoid
+GROUP BY 1
+  ),
+
+
+ --STEP 7: Prep join of Session ID & Date
+  session_dates AS (
+    SELECT DISTINCT
+      session_id,
+      date
+    FROM revised_pseudoid
+  )
+
+
+--STEP 8: JOIN Dates with Session IDs
+
+SELECT
+  d.session_id,
+  d.date,
+  s.revised_user_id,
+  s.revised_session_id,
+  s.revised_user_pseudo_id,
+  s.revised_user_id_array,
+FROM 
+  session_dates d
+LEFT JOIN 
+  session_summary_revised_ids s ON d.session_id = s.session_id;
+
+END;
+ELSE
+  -- If the source data count is 0, raise an error to stop the process.
+   RAISE USING MESSAGE = FORMAT("Data processing failed. Source day count: %d (expected %d), Destination day count: %d. The target table was not modified.", source_day_count, expected_day_count, destination_day_count);
+END IF;
