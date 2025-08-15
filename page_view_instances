@@ -1,0 +1,112 @@
+/*
+CODE DESCRIPTION
+This BQ SQL emulates pageviews, relying on page location changes instead of page_view events. 
+*/
+
+
+select_fields AS(
+  SELECT
+    session_id,
+    event_date,
+    user_pseudo_id,
+    page_location,
+    nullif(`nbglobal-ga-ga4-bq.udf.page_path`(page_location), '') as page_path,
+    site_region,
+    site_country,
+    session_source,
+    session_medium,
+    session_campaign,
+    session_default_channel_group,
+    session_primary_channel_group,
+    device,
+    login_status,
+    page_type,
+    event_name,
+    event_timestamp,
+  FROM `nbglobal-ga-ga4-bq.ga4_reporting.v_flat_ga4_events`
+),
+
+
+
+
+-- Step 2: Identify when the page_path changes from the previous event.
+page_path_lag AS (
+    SELECT
+        *,
+        LAG(page_location, 1) OVER (PARTITION BY session_id ORDER BY event_timestamp ASC) as previous_page_location
+    FROM select_fields
+),
+
+
+
+
+-- Step 3: Create a unique rank ID that increments only when the page_path changes.
+page_view_ranking AS (
+    SELECT
+        *,
+        -- Create an incrementing ID for each new page visited in the session.
+        SUM(IF(page_location != previous_page_location OR previous_page_location IS NULL, 1, 0)) OVER (PARTITION BY session_id ORDER BY event_timestamp ASC) as page_view_instance,
+        -- Create a flag for page_view events
+        IF(event_name = 'page_view', 1, 0) AS is_page_view
+    FROM page_path_lag
+),
+
+
+
+-- Step 4: Aggregate data to the page_view_rank level with conditional logic.
+grouped_by_instance AS (
+    SELECT
+        session_id,
+        page_view_instance,
+        MIN(event_timestamp) as event_timestamp,
+        MAX(page_path) as page_path, --potentially change to min non-null value
+        MAX(page_location) as page_location,
+        MAX(user_pseudo_id) as user_pseudo_id,
+        MAX(site_region) as site_region,
+        MAX(site_country) as site_country,
+        MAX(event_date) as event_date,
+        MAX(device) device,
+        MAX(login_status) as login_status,
+        MAX(session_source) as session_source,
+        MAX(session_medium) as session_medium,
+        MAX(session_campaign) as session_campaign,
+        MAX(session_default_channel_group) as session_default_channel_group,
+        MAX(session_primary_channel_group) as session_primary_channel_group,
+
+        -- This logic takes the value from the page_view event if it exists, otherwise it returns 'No page_view event fired'.
+        -- Pageview specific parameters. Other events may overwrite parameter value
+        IF(
+            MAX(is_page_view) = 1,
+            ARRAY_AGG(IF(is_page_view = 1, page_type, NULL) IGNORE NULLS ORDER BY event_timestamp LIMIT 1)[SAFE_OFFSET(0)],
+            'No page_view event fired'
+        ) as page_type,
+
+        -- Calculate time on this page instance
+        -- TIMESTAMP_DIFF(MAX(event_timestamp), MIN(event_timestamp), SECOND) as time_on_page_in_secs
+        --max(event_timestamp) -  min(event_timestamp) as timie_on_page_in_secs
+    FROM
+        page_view_ranking
+    GROUP BY
+        session_id, page_view_instance
+),
+
+-- Step 5: Add the max rank for the session to identify the exit page instance.
+add_max_instance AS (
+    SELECT
+        *,
+        MAX(page_view_instance) OVER (PARTITION BY session_id) as max_instance_in_session
+    FROM
+        grouped_by_instance
+),
+
+
+-- Step 6: Add the final entrance and exit flags.
+final_table AS (
+    SELECT
+        *,
+        case when(page_view_instance = 1) then 1 end AS is_entrance_page,
+        case when(page_view_instance = max_instance_in_session) then 1 end AS is_exit_page,
+        udf.content_category(page_location, page_path) as content_category,
+    FROM
+        add_max_instance
+)
