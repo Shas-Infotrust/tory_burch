@@ -1,56 +1,55 @@
-
-/*
-CODE DESCRIPTION
-The scheduled queries procedure is designed to templatize repeatable processes.
-
-PROCEDURE LOGIC
-Source Table Check: Confirms the source table contains all specified dates, each with at least one non-null value for the indicated "check" field.
-If not, the query fails and an error message is generated.
-
-Destination Table Check: Ensures the destination table has fewer dates than the ones being added, each with at least one non-null value for the indicated "check" field.
-If this condition is not met, it means the table has already been updated, so the process stops before running the main table query (view).
-No error message is generated in this case.
-
-Insert Process: If both checks pass, the procedure runs Delete & Insert operations.
-Since this is a transaction, if any part of the query fails, the job will fail and the table will roll back to its previous version.
-When a failure occurs, an error message is surfaced.'
-
-SETUP
-1) Create a View:  Build the final version of the query that the procedure will reference for inserting data. This centralizes the query so that any updates automatically affect all scheduled queries.
-2) Call the Procedure: Pass in all required "arguments" (variables) for the specific table creation. Because the procedure is templatized, updates to the routine will automatically propagate to all scheduled queries.
-3) Schedule the Procedure: Use the same procedure and variables for all scheduled queries requiring the same updates to the table.
-----Once scheduled, you won’t need to modify the scheduled query unless updating variables or pausing it.
-----From that point, all updates are handled in the view or the procedure.
-
-*/
-
-
-
-
-CREATE OR REPLACE PROCEDURE `bigquery-prod-356116.ga4_2_PipelineAutomation.r_ga4_2_ScheduledQuery`(interval_start_date INT64, interval_end_date INT64, source_table STRING, source_date_field STRING, source_field_check_values STRING, destination_table STRING, destination_date_field STRING, destination_field_check_values STRING, query_view STRING, query_date_field STRING)
-OPTIONS (description="- interval_start_date: The start of the date range, as days ago from today.\n- interval_end_date: The end of the date range, as days ago from today.\n- source_table: The source table (e.g., `project.dataset.table_*`).\n- source_date_field: Date field in the source table.\n- source_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date. \n- destination_table: The target table for the DELETE and INSERT operations.\n- destination_date_field: Date field in the destination table. \n- destination_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date. \n- query_view: The view that is used to query data for insertion.\n- query_date_field: The date field withing the view. Important as it prevents the entire date range to run. ")
 BEGIN
 
 /*
 This stored procedure deletes data within a specified date range from a destination table
 and inserts fresh data from a source view into the destination table, after performing data validation checks.
 
-Arguments:
-- interval_start_date: The start of the date range, as days ago from today.
-- interval_end_date: The end of the date range, as days ago from today.
-- source_table: The source table (e.g., `project.dataset.table_*`).
-- source_date_field: Date field in the source table.
-- source_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date. 
+
+ARGUMENTS:
+- interval_start_date: The start of the date range, as days ago from today. This must match the interval in the view. (Validation purposes) 
+- interval_end_date: The end of the date range, as days ago from today. This must match the interval in the view. (Validation purposes) 
+- source_table: The source table (e.g., `project.dataset.table_*`). (Validation purposes) 
+- source_date_field: Date field in the source table. (Validation purposes) 
+- source_uses_table_suffix: Clarify if source check should use Table Suffix instead of Date. (Enter TRUE or FALSE) (Validation purposes) 
+- source_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date.  (Validation purposes) 
 - destination_table: The target table for the DELETE and INSERT operations.
-- destination_date_field: Date field in the destination table. 
-- destination_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date. 
+- destination_date_field: Date field in the destination table. (Validation purposes) 
+- destination_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date.(Validation purposes)  
 - query_view: The view that is used to query data for insertion.
-- query_date_field: The date field withing the view. Important as it prevents the entire date range to run. 
+
+
+LOGIC:
+1) Check if the Source Table contains all existing dates specified.
+2) Check if the Source Table exists in the Query View.
+3) Check if the intervals in the Procedure match the intervals in the Query View.
+4) Check if Destination Table has all specified dates. If so, then do not update. No error raised. 
+5) Run Delete and Insert Query View. Transaction is atomic, so if it fails, then the Tables will be rolled back to previous state. 
+
+REMINDER
+--All views need "runDates" CTE to make sure the intervals match across views and procedures. Make sure to leverage the startDate and endDate throughout the view.
+
+runDates as (
+  select
+      DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY) as startDate,
+      DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) as endDate,
+),
+
+suffixDates as (
+  select
+    FORMAT_DATE('%Y%m%d', startDate) as suffixStartDate,
+    FORMAT_DATE('%Y%m%d', endDate) as suffixEndDate
+  FROM
+    runDates
+),
+
 */
 
 -- Step 1: Declare variables. This makes them available to the entire script.
 DECLARE StartDate, EndDate DATE;
-DECLARE expected_day_count, source_day_count, destination_day_count INT64;
+DECLARE suffixStartDate, suffixEndDate STRING;
+DECLARE expected_day_count, source_day_count, destination_day_count,is_view_valid INT64;
+DECLARE view_parts ARRAY<STRING>;
+DECLARE view_start_interval, view_end_interval INT64;
 
 -- Step 2: Set the DATE variables
 SET (StartDate, EndDate) = (
@@ -59,12 +58,32 @@ SET (StartDate, EndDate) = (
       DATE_SUB(CURRENT_DATE(), INTERVAL interval_start_date DAY),
       DATE_SUB(CURRENT_DATE(), INTERVAL interval_end_date DAY)
 );
+SET (suffixStartDate, suffixEndDate) = (
+  SELECT AS STRUCT 
+      FORMAT_DATE('%Y%m%d', StartDate),
+      FORMAT_DATE('%Y%m%d', EndDate)
+);
+
 
 -- Step 3: Calculate the expected number of days in the date range
 SET expected_day_count = DATE_DIFF(EndDate, StartDate, DAY) + 1;
 
 -- Step 4a: Check source table to ensure all days exist before trying to add them. 
 --Count how many distinct days of data actually exist in the source table.
+
+-- This block runs if you need to check the _TABLE_SUFFIX
+IF source_uses_table_suffix THEN --If source_uses_table_suffix is set to TRUE, then use Table Suffix for WHERE clause
+EXECUTE IMMEDIATE FORMAT("""
+    SELECT COUNT(DISTINCT PARSE_DATE('%%Y%%m%%d', _TABLE_SUFFIX))
+    FROM `%s`
+    WHERE _TABLE_SUFFIX BETWEEN ? AND ?
+    AND %s IS NOT NULL
+  """, source_table, source_field_check_values)
+  INTO source_day_count
+  USING suffixStartDate, suffixEndDate;
+
+-- This block runs for standard tables with a date column
+ELSE 
 EXECUTE IMMEDIATE FORMAT("""
   SELECT COUNT(DISTINCT %s)
   FROM `%t`
@@ -73,7 +92,7 @@ EXECUTE IMMEDIATE FORMAT("""
 """,source_date_field, source_table, source_date_field, source_field_check_values)
 INTO source_day_count
 USING StartDate, EndDate;
-
+END IF;
 
 -- Step 4b: Check if the SOURCE table contains all existing dates specified. If not, raise an error and exit.
 IF source_day_count != expected_day_count THEN
@@ -87,8 +106,48 @@ IF source_day_count != expected_day_count THEN
   );
 END IF;
 
+-- Step 4c: Check if the source table exists in the query view.
+SET view_parts = SPLIT(query_view, '.'); 
+--This line takes the full name of your view (which is a string like 'my-project.my_dataset.my_view') and splits it into an array of three parts: ['my-project', 'my_dataset', 'my_view'].
+--It will then will look into the views table within the correct project and dataset, WHERE table_name is 'my_view'
+--In the REGEX, view_definition is a special column in BigQuery's INFORMATION_SCHEMA that contains the actual SQL query used to create the view.
+--The REGEX will then look for the source_table in this view.
+EXECUTE IMMEDIATE FORMAT("""
+  SELECT COUNT(1)
+  FROM `%s.%s.INFORMATION_SCHEMA.VIEWS`
+  WHERE table_name = '%s'
+  AND REGEXP_CONTAINS(view_definition, r'%s')
+""", view_parts[OFFSET(0)], view_parts[OFFSET(1)], view_parts[OFFSET(2)], source_table)
+INTO is_view_valid;
 
---Step 5a: Validate the DESTINATION table.
+IF is_view_valid = 0 THEN
+  RAISE USING MESSAGE = FORMAT(
+    "View validation failed. The view `%s` does not appear to be built from the specified source table `%s` in the procedure.",
+    query_view,
+    source_table
+  );
+END IF;
+
+
+-- Step 4d: Check if the intervals in the procedure match the intervals in the view.
+EXECUTE IMMEDIATE FORMAT("""
+  SELECT
+    COALESCE(SAFE_CAST(REGEXP_EXTRACT(view_definition, r"DATE_SUB\\s*\\(\\s*CURRENT_DATE\\s*\\(\\s*\\)\\s*,\\s*INTERVAL\\s+(\\d+)\\s+DAY\\s*\\)\\s*as\\s*startDate") AS INT64), -1),
+    COALESCE(SAFE_CAST(REGEXP_EXTRACT(view_definition, r"DATE_SUB\\s*\\(\\s*CURRENT_DATE\\s*\\(\\s*\\)\\s*,\\s*INTERVAL\\s+(\\d+)\\s+DAY\\s*\\)\\s*as\\s*endDate") AS INT64), -1)
+  FROM `%s.%s.INFORMATION_SCHEMA.VIEWS`
+  WHERE table_name = '%s'
+""", view_parts[OFFSET(0)], view_parts[OFFSET(1)], view_parts[OFFSET(2)])
+INTO view_start_interval, view_end_interval;
+
+IF view_start_interval != interval_start_date OR view_end_interval != interval_end_date THEN
+  RAISE USING MESSAGE = FORMAT(
+    "Interval validation failed: The date intervals in the procedure call (%d, %d) do not match the date intervals defined in the view `%s` (%d, %d).",
+    interval_start_date, interval_end_date, query_view, view_start_interval, view_end_interval
+  );
+END IF;
+
+
+--Step 5: Validate the DESTINATION table.
 EXECUTE IMMEDIATE FORMAT ("""
 SELECT COUNT(DISTINCT(%s))
 FROM `%t`
@@ -100,7 +159,7 @@ USING StartDate, EndDate;
 
 
 
---Step 5b: Check if the destination data has the specified dates. If all specified dates exist, then don't run the query. Raise error and exit. 
+--Step 5b: Check if Destination Table has all specified dates. If so, then do not update. No error raised. 
 IF destination_day_count < expected_day_count THEN
 
   BEGIN TRANSACTION; --makes sure operations are atomic. If any part of the block fails, it will automatically "roll back" all the changes made inside that block. So, if the INSERT fails, the DELETE is undone as if it never happened
@@ -110,15 +169,15 @@ IF destination_day_count < expected_day_count THEN
 EXECUTE IMMEDIATE FORMAT("""
 DELETE FROM `%t`
 WHERE %s BETWEEN ? AND ?
-""", destination_table, query_date_field)
+""", destination_table, destination_date_field)
 USING StartDate, EndDate;
 
-EXECUTE IMMEDIATE FORMAT("""
-INSERT INTO `%t`
-SELECT * FROM `%t`
-WHERE %s BETWEEN ? and ?
-""", destination_table, query_view, query_date_field)
-USING StartDate, EndDate;
+
+  EXECUTE IMMEDIATE FORMAT("""
+  INSERT INTO `%s`
+  SELECT * FROM `%s`
+  """, destination_table, query_view);
+
 
 COMMIT TRANSACTION;
 
@@ -131,4 +190,4 @@ EXCEPTION WHEN ERROR THEN
 END IF;
 -- If the condition above is false, the procedure completes successfully without taking action.
 
-END;
+END
