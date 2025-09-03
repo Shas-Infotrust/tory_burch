@@ -164,24 +164,34 @@ USING StartDate, EndDate;
 --Step 5b: Check if Destination Table has all specified dates. If so, then do not update. No error raised. 
 IF destination_day_count < expected_day_count THEN
 
-  BEGIN TRANSACTION; --makes sure operations are atomic. If any part of the block fails, it will automatically "roll back" all the changes made inside that block. So, if the INSERT fails, the DELETE is undone as if it never happened
 
+--Step 6: Create a temporary table, delete old data in destination table, & insert temporary table into destination table. 
   BEGIN
 
-EXECUTE IMMEDIATE FORMAT("""
-DELETE FROM `%t`
-WHERE %s BETWEEN ? AND ?
-""", destination_table, destination_date_field)
-USING StartDate, EndDate;
+    -- Step 6a - Run the query first and save the results to a temporary table.
+    EXECUTE IMMEDIATE FORMAT("""
+    CREATE OR REPLACE TEMP TABLE data_to_insert AS
+    SELECT * FROM `%t`
+    """, query_view);
 
+    -- Start the transaction for the DELETE and INSERT
+    BEGIN TRANSACTION;
 
-  EXECUTE IMMEDIATE FORMAT("""
-  INSERT INTO `%s`
-  SELECT * FROM `%s`
-  """, destination_table, query_view);
+    -- Step 6b: Delete the old data in the destination table.
+    EXECUTE IMMEDIATE FORMAT("""
+    DELETE FROM `%t`
+    WHERE %s BETWEEN ? AND ?
+    """, destination_table, destination_date_field)
+    USING StartDate, EndDate;
 
+    -- Step 7: Insert the new, pre-queried data from the temporary table.
+    EXECUTE IMMEDIATE FORMAT("""
+    INSERT INTO `%t`
+    SELECT * FROM data_to_insert
+    """, destination_table);
 
-COMMIT TRANSACTION;
+    COMMIT TRANSACTION;
+
 
 EXCEPTION WHEN ERROR THEN
     -- If any error occurs, the transaction is rolled back automatically.
