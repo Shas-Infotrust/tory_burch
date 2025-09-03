@@ -1,3 +1,5 @@
+CREATE OR REPLACE PROCEDURE `bigquery-prod-356116.ga4_2_PipelineAutomation.r_ga4_2_ScheduledQuery`(interval_start_date INT64, interval_end_date INT64, source_table STRING, source_date_field STRING, source_uses_table_suffix BOOL, source_field_check_values STRING, destination_table STRING, destination_date_field STRING, destination_field_check_values STRING, query_view STRING)
+OPTIONS (description="Arguments:\n- interval_start_date: The start of the date range, as days ago from today. This must match the interval in the view. (Validation purposes) \n- interval_end_date: The end of the date range, as days ago from today. This must match the interval in the view. (Validation purposes) \n- source_table: The source table (e.g., `project.dataset.table_*`). (Validation purposes) \n- source_date_field: Date field in the source table. (Validation purposes) \n- source_uses_table_suffix: Clarify if source check should use Table Suffix instead of Date. (Enter TRUE or FALSE) (Validation purposes) \n- source_field_check_values: The field that is checked to ensure that each date contains non-null values in a particular field. If not applicable, just add date.  (Validation purposes) \n- destination_table: The target table for the DELETE and INSERT operations.\n- destination_date_field: Date field in the destination table. (Validation purposes) \n- destination_field_check_values: The field that is checked to ensure that there is a date that has null values in a particular field & needs to be updated. If not applicable, just add date.(Validation purposes)  \n- query_view: The view that is used to query data for insertion.")
 BEGIN
 
 /*
@@ -190,4 +192,4 @@ EXCEPTION WHEN ERROR THEN
 END IF;
 -- If the condition above is false, the procedure completes successfully without taking action.
 
-END
+END;
